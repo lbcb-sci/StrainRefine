@@ -9,6 +9,8 @@ The method can be used as a **standalone post-mapping refinement step** or **int
 
 # Overview
 
+![StrainRefine workflow](figures/method_overview.png)
+
 Strain-level metagenomic classification is challenging because reads originating from a single strain often map equally well to several closely related reference genomes. This can lead to redundant detections and large numbers of false-positive strain calls.
 
 StrainRefine addresses this problem by analyzing **read–reference mapping profiles**:
