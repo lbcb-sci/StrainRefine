@@ -22,6 +22,28 @@ logging.basicConfig(
     ]
 )
 
+def compute_horizontal_coverage(ref_intervals, ref_name):
+    """
+    ref_intervals: dict of ref_name -> ([list of (t_start, t_end)], ref_length)
+    Returns fraction of reference genome covered (0.0 – 1.0)
+    """
+    if ref_name not in ref_intervals:
+        return 0.0
+    intervals, ref_len = ref_intervals[ref_name]
+    if not intervals or ref_len == 0:
+        return 0.0
+    intervals = sorted(intervals)
+    cur_s, cur_e = intervals[0]
+    covered = 0
+    for s, e in intervals[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            covered += cur_e - cur_s
+            cur_s, cur_e = s, e
+    covered += cur_e - cur_s
+    return covered / ref_len
+
 def read_reference_scores(filename):
     with open(filename, 'rb') as file:
         reference_scores = pickle.load(file)
@@ -75,8 +97,6 @@ def species_split(U, NU, species_class, genomes, SS_info_json):
         NU_species[s][read_id] = new_value_list
 
     return U_species, NU_species
-
-    
 
 
 def species_identification_with_thresholds(U, NU, genomes, species_count, SS_info_json,
@@ -329,6 +349,7 @@ def calculate_mapping_class(paf_path, species_strain_info, mapping_class_path=No
     genomes_id = 0
     genomes_list = []
     species_count = {}
+    ref_intervals = {}   # ref_name -> ([intervals], ref_length)
 
     with open(paf_path, "r") as f:
         line = f.readline()
@@ -341,12 +362,12 @@ def calculate_mapping_class(paf_path, species_strain_info, mapping_class_path=No
             length_t = int(parts[8].strip()) - int(parts[7].strip())
             length_a = int(parts[10].strip())
 
+            t_len   = int(parts[6])   # target sequence length
+            t_start = int(parts[7])   # target start
+            t_end   = int(parts[8])   # target end
             length = max(length_t, length_q)
-            #nm = int(parts[9].strip().split(':')[-1])
             nm = int(parts[9].strip())
             value_cig = float(nm) / float(length)
-            # print(value_cig)
-            # value_cig = float(nm) - 4*(length_a-nm)
 
             ref_prediction = parts[5].strip()
             taxid = ref_prediction.split('|')[1]
@@ -356,6 +377,10 @@ def calculate_mapping_class(paf_path, species_strain_info, mapping_class_path=No
                 species_count[species_taxid] += 1
             else:
                 species_count[species_taxid] = 1
+
+            if ref_prediction not in ref_intervals:
+                ref_intervals[ref_prediction] = ([], t_len)
+            ref_intervals[ref_prediction][0].append((t_start, t_end))
 
             if ref_prediction not in genomes_list:
                 genomes[genomes_id] = ref_prediction
@@ -378,7 +403,6 @@ def calculate_mapping_class(paf_path, species_strain_info, mapping_class_path=No
                 predictions_mapping_vcg[read_id] = {ref_prediction:float(value_cig)}
                 predictions_mapping_vcg_count[read_id] = {ref_prediction:1}
 
-            # print(predictions_mapping_vcg)
             line = f.readline()
 
     for read_id, candidates in predictions_mapping_vcg.items():
@@ -413,7 +437,7 @@ def calculate_mapping_class(paf_path, species_strain_info, mapping_class_path=No
     if mapping_class_path is not None:
         mapping_output(mapping_class_path, predictions_mapping)
 
-    return U, NU, genomes, species_count
+    return U, NU, genomes, species_count, ref_intervals
 
 
 def pathoscope_redistribution(NU, genomes):
@@ -444,7 +468,6 @@ def find_medoid_and_avg_distance(cluster_indices, dist_matrix):
         return cluster_indices[0], 0.0 
     
     sub_matrix = dist_matrix[np.ix_(cluster_indices, cluster_indices)]
-    #print(sub_matrix)
     upper = sub_matrix[np.triu_indices_from(sub_matrix, k=1)]
     mean_distance = upper.mean()
     medoid_idx = cluster_indices[np.argmin(sub_matrix.mean(axis=1))]
@@ -651,8 +674,6 @@ def summarize_cluster_support(clusters, reference_scores, high_score_threshold):
     logging.info("Total low score reads globally: {}".format(len(low_score_reads_global)))
     logging.info("==========================================")
 
-    # print(ref_high_scores)
-
     return {
         "ref_high_scores": ref_high_scores,
         "ref_high_scores_global": ref_high_scores_global,
@@ -675,8 +696,6 @@ def choose_reference_reassignments(clusters, clusters_species, s_genome_read_dic
                 ref_high_scores[ref] = 0
             if ref not in ref_high_scores_global:
                 ref_high_scores_global[ref] = 0.0
-
-            #print("Reference: {}, High Scores: {}".format(ref, ref_high_scores[ref]))
 
             weak_ref = (
                 (ref_high_scores[ref] < cfg["min_high_score_reads"]) or
@@ -725,7 +744,6 @@ def choose_reference_reassignments(clusters, clusters_species, s_genome_read_dic
                     )
                     break
 
-    # print(changes)
     logging.info("==========================================")
     return changes
 
@@ -785,6 +803,32 @@ def write_final_assignments(classified, initial_changes, cluster_changes, output
 
             f.write(f"{read_id} : {final_ref}\n")
 
+def write_reference_summary(classified, initial_changes, cluster_changes,
+                             ref_intervals, output_path):
+    """
+    Write a TSV with one row per final reference:
+        reference_name  \t  read_count  \t  horizontal_coverage
+    """
+    ref_count = {}
+    for read_id, ref in classified:
+        if ref in cluster_changes:
+            final_ref = cluster_changes[ref]
+        elif ref in initial_changes:
+            final_ref = initial_changes[ref]
+        else:
+            final_ref = ref
+        if final_ref == "":
+            final_ref = ref
+        ref_count[final_ref] = ref_count.get(final_ref, 0) + 1
+
+    with open(output_path, "w") as f:
+        f.write("reference\tread_count\thorizontal_coverage\n")
+        for ref, count in sorted(ref_count.items(), key=lambda x: x[1], reverse=True):
+            hcov = compute_horizontal_coverage(ref_intervals, ref)
+            f.write(f"{ref}\t{count}\t{hcov:.6f}\n")
+
+    logging.info(f"Reference summary written to {output_path}")
+
 
 def run(args):
     logging.info("Parameters:")
@@ -806,7 +850,7 @@ def run(args):
     initialize_clustering_output_dir(args.clustering_out)
 
     species_strain_info = load_dict_from_json(args.strain_species_info)
-    U, NU, genomes, species_count = calculate_mapping_class(
+    U, NU, genomes, species_count, ref_intervals = calculate_mapping_class(
         args.paf_path, species_strain_info, mapping_class_path=None, beta=0.5
     )
 
@@ -851,7 +895,6 @@ def run(args):
             species_data["ref_count"]
         )
 
-
         clustering_result = cluster_species_references(
             s,
             species_data["genome_read_dict"],
@@ -874,7 +917,7 @@ def run(args):
         s_genome_read_dicts,
         support_summary["ref_high_scores"],
         support_summary["ref_high_scores_global"],
-        cfg
+        cfg,
     )
 
     ref_count = get_ref_count(classified, changes)
@@ -883,7 +926,6 @@ def run(args):
         clusters, ref_count
     )
 
-
     write_final_cluster_outputs(args.clustering_out, updated_clusters, representatives_new)
     write_final_assignments(
         classified,
@@ -891,10 +933,16 @@ def run(args):
         changes2,
         args.read_class_output
     )
+    write_reference_summary(
+        classified,
+        changes,
+        changes2,
+        ref_intervals,
+        args.ref_summary_output
+    )
 
     logging.info("Total assigned reads: {}".format(assigned_reads))
-   
-  
+
 
 def main():
 
@@ -936,30 +984,34 @@ def main():
 
     parser.add_argument(
         "--species_min_read_count", type=int, default=5,
-        help="Minimum read count threshold for species reliability. Currently informative only unless species identification is refactored (default=5)."
+        help="Minimum read count threshold for species reliability (default=5)."
     )
 
     parser.add_argument(
         "--species_min_mean_score", type=float, default=0.6,
-        help="Minimum mean score threshold for species reliability. Currently informative only unless species identification is refactored (default=0.6)."
+        help="Minimum mean score threshold for species reliability (default=0.6)."
     )
 
     parser.add_argument(
         "--species_low_count_cap", type=int, default=30,
-        help="Species with mean score below threshold and read count below this cap are treated as unreliable. Currently informative only unless species identification is refactored (default=30)."
+        help="Species with mean score below threshold and read count below this cap are treated as unreliable (default=30)."
     )
-
 
     parser.add_argument(
         "--read_class_output", type=str, default="read_classification.out",
-        help="Path to the output file with classification labels for reads. (default=read_classification.out)" 
+        help="Path to the output file with classification labels for reads (default=read_classification.out)."
     )
 
     parser.add_argument(
-    "--clustering_out", type=str, default="clustering_output",
-    help="Path to the directory for clustering-related output files (default=clustering_output)."
-)
-    
+        "--clustering_out", type=str, default="clustering_output",
+        help="Path to the directory for clustering-related output files (default=clustering_output)."
+    )
+
+    parser.add_argument(
+        "--ref_summary_output", type=str, default="reference_summary.tsv",
+        help="Path to TSV file with per-reference read counts and horizontal coverage (default=reference_summary.tsv)."
+    )
+
     args = parser.parse_args()
 
     run(args)
