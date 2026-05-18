@@ -158,8 +158,8 @@ This is a tab-separated file with a header line. Each subsequent line correspond
 
 ```
 reference    read_count    horizontal_coverage
-NC_000913.3|511145|...    4821    0.923400
-NC_002695.2|83334|...     312     0.187200
+|511145|NC_000913.3   4821    0.923400
+|83334|NC_002695.2     312     0.187200
 ```
 
 - **reference** — reference genome identifier as it appears in the PAF file
