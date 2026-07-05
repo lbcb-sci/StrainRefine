@@ -23,26 +23,7 @@ logging.basicConfig(
 )
 
 def compute_horizontal_coverage(ref_intervals, ref_name):
-    """
-    ref_intervals: dict of ref_name -> ([list of (t_start, t_end)], ref_length)
-    Returns fraction of reference genome covered (0.0 – 1.0)
-    """
-    if ref_name not in ref_intervals:
-        return 0.0
-    intervals, ref_len = ref_intervals[ref_name]
-    if not intervals or ref_len == 0:
-        return 0.0
-    intervals = sorted(intervals)
-    cur_s, cur_e = intervals[0]
-    covered = 0
-    for s, e in intervals[1:]:
-        if s <= cur_e:
-            cur_e = max(cur_e, e)
-        else:
-            covered += cur_e - cur_s
-            cur_s, cur_e = s, e
-    covered += cur_e - cur_s
-    return covered / ref_len
+    return ref_intervals.get(ref_name, 0.0)
 
 def read_reference_scores(filename):
     with open(filename, 'rb') as file:
@@ -58,14 +39,13 @@ def load_dict_from_json(filename):
     with open(filename, 'r') as file:
         return json.load(file)
 
-def species_split(U, NU, species_class, genomes, SS_info_json):
-    SS_info = load_dict_from_json(SS_info_json)
-
-    species = list(set(species_class.values()))
+def species_split(U, NU, species_class, genomes, SS_info):
+    species = set(species_class.values())
+    genome_species = {ind: SS_info[name.split('|')[1]] for ind, name in genomes.items()}
 
     U_species = {}
     NU_species = {}
-    
+
     for s in species:
         U_species[s] = {}
         NU_species[s] = {}
@@ -78,21 +58,15 @@ def species_split(U, NU, species_class, genomes, SS_info_json):
         s = species_class[read_id]
         new_value_list = [[], [], [], 0]
         for i, ind in enumerate(value_list[0]):
-            s_v = SS_info[genomes[ind].split('|')[1]]
-            if s_v == s:
-                tmp = new_value_list[0]
-                tmp.append(ind)
-                new_value_list[0] = tmp
+            if genome_species[ind] == s:
+                new_value_list[0].append(ind)
+                new_value_list[1].append(value_list[1][i])
+                new_value_list[2].append(value_list[2][i])
+                new_value_list[3] = max(new_value_list[3], value_list[2][i])
 
-                tmp = new_value_list[1]
-                tmp.append(value_list[1][i])
-                new_value_list[1] = tmp
-
-                tmp = new_value_list[2]
-                tmp.append(value_list[2][i])
-                new_value_list[2] = tmp
-
-                new_value_list[3] = max(new_value_list[2])
+        if not new_value_list[0]:
+            logging.warning(f"Read {read_id} assigned to species {s} but has no mappings to it — skipping")
+            continue
 
         NU_species[s][read_id] = new_value_list
 
@@ -134,32 +108,45 @@ def species_identification_with_thresholds(U, NU, genomes, species_count, SS_inf
         
         return species_scores
     
+    all_species_scores = {
+        read_id: get_species_scores_for_read(read_id)
+        for read_id in all_mappings
+    }
+    all_max_species_scores = {
+        read_id: {sp: max(s[0] for s in scores) for sp, scores in ssd.items()}
+        for read_id, ssd in all_species_scores.items()
+    }
+    all_sorted_species = {
+        read_id: sorted(max_scores.items(), key=lambda x: x[1], reverse=True)
+        for read_id, max_scores in all_max_species_scores.items()
+    }
+    del all_species_scores
+
     species_class = {}
     initial_ties = 0
 
     for read_id in all_mappings.keys():
-        species_scores = get_species_scores_for_read(read_id)
-        
+        max_scores = all_max_species_scores[read_id]
+
         best_species = None
         best_score = -1
         candidates = []
-        
-        for species, scores in species_scores.items():
-            max_score = max(s[0] for s in scores)
+
+        for species, max_score in max_scores.items():
             if max_score > best_score:
                 best_score = max_score
                 best_species = species
                 candidates = [species]
             elif max_score == best_score:
                 candidates.append(species)
-        
+
         if len(candidates) > 1:
             initial_ties += 1
             best_species = random.choice(candidates)
             logging.debug(
                 f"Initial tie for read {read_id}: candidates={candidates}, chosen={best_species}"
             )
-        
+
         species_class[read_id] = best_species
 
     logging.info(
@@ -173,37 +160,30 @@ def species_identification_with_thresholds(U, NU, genomes, species_count, SS_inf
     
     while not stable and iteration < max_iterations:
         iteration += 1
-        species_class_old = species_class.copy()
-        
+
         species_read_counts = {}
-        species_scores = {}
-        
+        species_score_sums = {}
+        species_score_counts = {}
+
         for read_id, species in species_class.items():
-            if species not in species_read_counts:
-                species_read_counts[species] = 0
-                species_scores[species] = []
-            
-            species_read_counts[species] += 1
-            
-            species_score_dict = get_species_scores_for_read(read_id)
-            if species in species_score_dict:
-                best_score = max(s[0] for s in species_score_dict[species])
-                species_scores[species].append(best_score)
-        
+            species_read_counts[species] = species_read_counts.get(species, 0) + 1
+            max_scores = all_max_species_scores[read_id]
+            if species in max_scores:
+                species_score_sums[species] = species_score_sums.get(species, 0.0) + max_scores[species]
+                species_score_counts[species] = species_score_counts.get(species, 0) + 1
+
         species_mean_scores = {
-            s: np.mean(species_scores[s]) if species_scores[s] else 0
-            for s in species_scores
+            s: species_score_sums[s] / species_score_counts[s] if species_score_counts.get(s, 0) > 0 else 0.0
+            for s in species_read_counts
         }
         
-        threshold_read_count = min_read_count
-        threshold_mean_score = min_mean_score
         unreliable_species = set()
-        
+
         for s in species_read_counts:
             if (
-                species_read_counts[s] < threshold_read_count or
+                species_read_counts[s] < min_read_count or
                 (
-                    species_mean_scores[s] < threshold_mean_score and
+                    species_mean_scores[s] < min_mean_score and
                     species_read_counts[s] < low_count_cap
                 )
             ):
@@ -233,16 +213,7 @@ def species_identification_with_thresholds(U, NU, genomes, species_count, SS_inf
             current_species = species_class[read_id]
             
             if current_species in unreliable_species:
-                species_score_dict = get_species_scores_for_read(read_id)
-                
-                species_sorted = sorted(
-                    species_score_dict.items(),
-                    key=lambda x: max(s[0] for s in x[1]),
-                    reverse=True
-                )
-                
-                found_reliable = False
-                for species, _ in species_sorted:
+                for species, _ in all_sorted_species[read_id]:
                     if species not in unreliable_species:
                         if species_class[read_id] != species:
                             logging.debug(
@@ -251,43 +222,38 @@ def species_identification_with_thresholds(U, NU, genomes, species_count, SS_inf
                             )
                             reassigned_from_unreliable += 1
                         species_class[read_id] = species
-                        found_reliable = True
                         break
-                
-            else:
-                species_score_dict = get_species_scores_for_read(read_id)
-                current_score = max(s[0] for s in species_score_dict[current_species])
-                
-                max_score = -1
-                tied_species = []
-                for species, scores in species_score_dict.items():
-                    sp_max = max(s[0] for s in scores)
-                    if sp_max > max_score:
-                        max_score = sp_max
-                        tied_species = [species]
-                    elif sp_max == max_score and species != current_species:
-                        tied_species.append(species)
-                
-                if tied_species:
-                    reliable_tied = [s for s in tied_species if s not in unreliable_species]
-                    if reliable_tied:
-                        best_tied = max(
-                            reliable_tied,
-                            key=lambda s: species_read_counts.get(s, 0)
-                        )
-                        if species_read_counts.get(best_tied, 0) > species_read_counts.get(current_species, 0):
-                            logging.debug(
-                                f"Iteration {iteration}: read {read_id} tie-resolved "
-                                f"from {current_species} to {best_tied}"
-                            )
-                            species_class[read_id] = best_tied
-                            reassigned_by_tie_break += 1
-        
-        stable = (species_class == species_class_old)
 
-        changed_reads = sum(
-            1 for read_id in species_class if species_class[read_id] != species_class_old[read_id]
-        )
+            else:
+                max_scores = all_max_species_scores[read_id]
+                current_score = max_scores[current_species]
+
+                best_alt_score = -1
+                best_alt_species = None
+                for species, sp_max in max_scores.items():
+                    if species == current_species or species not in species_read_counts or species in unreliable_species:
+                        continue
+                    if sp_max > best_alt_score or (
+                        sp_max == best_alt_score and
+                        species_read_counts.get(species, 0) > species_read_counts.get(best_alt_species, 0)
+                    ):
+                        best_alt_score = sp_max
+                        best_alt_species = species
+
+                if best_alt_species is not None:
+                    if best_alt_score > current_score or (
+                        best_alt_score == current_score and
+                        species_read_counts.get(best_alt_species, 0) > species_read_counts.get(current_species, 0)
+                    ):
+                        logging.debug(
+                            f"Iteration {iteration}: read {read_id} tie-resolved "
+                            f"from {current_species} to {best_alt_species}"
+                        )
+                        species_class[read_id] = best_alt_species
+                        reassigned_by_tie_break += 1
+        
+        changed_reads = reassigned_from_unreliable + reassigned_by_tie_break
+        stable = (changed_reads == 0)
 
         logging.info(
             f"Iteration {iteration} summary: "
@@ -338,129 +304,105 @@ def mapping_output(mapping_class_path, predictions_mapping):
 def calculate_mapping_class(paf_path, species_strain_info, mapping_class_path=None, beta=2):
     logging.info("Mapping information extraction.")
 
-    predictions_mapping = {}
-    predictions_mapping_vcg = {}
-    predictions_mapping_vcg_count = {}
     U = {}
     NU = {}
+    read_genome_idx = {}  # read_id -> {ref_id: list_index} for O(1) duplicate detection
+    nu_reads = set()
 
     genomes = {}
     genomes_names = {}
     genomes_id = 0
-    genomes_list = []
     species_count = {}
-    ref_intervals = {}   # ref_name -> ([intervals], ref_length)
+    ref_intervals = {}
+    predictions_mapping = {}
 
-    with open(paf_path, "r") as f:
-        line = f.readline()
-        while line != '':
-
+    with open(paf_path) as f:
+        for line in f:
             parts = line.split()
-            read_id = parts[0]
-        
-            length_q = int(parts[3].strip()) - int(parts[2].strip())
-            length_t = int(parts[8].strip()) - int(parts[7].strip())
-            length_a = int(parts[10].strip())
+            read_id  = parts[0]
+            t_start  = int(parts[7])
+            t_end    = int(parts[8])
+            t_len    = int(parts[6])
+            length_t = t_end - t_start
+            length_q = int(parts[3]) - int(parts[2])
+            nm       = int(parts[9])
+            value_cig = nm / max(length_t, length_q)
 
-            t_len   = int(parts[6])   # target sequence length
-            t_start = int(parts[7])   # target start
-            t_end   = int(parts[8])   # target end
-            length = max(length_t, length_q)
-            nm = int(parts[9].strip())
-            value_cig = float(nm) / float(length)
-
-            ref_prediction = parts[5].strip()
+            ref_prediction = parts[5]
             taxid = ref_prediction.split('|')[1]
             species_taxid = species_strain_info[taxid]
-
-            if species_taxid in species_count:
-                species_count[species_taxid] += 1
-            else:
-                species_count[species_taxid] = 1
+            species_count[species_taxid] = species_count.get(species_taxid, 0) + 1
 
             if ref_prediction not in ref_intervals:
                 ref_intervals[ref_prediction] = ([], t_len)
             ref_intervals[ref_prediction][0].append((t_start, t_end))
 
-            if ref_prediction not in genomes_list:
+            if ref_prediction not in genomes_names:
                 genomes[genomes_id] = ref_prediction
                 genomes_names[ref_prediction] = genomes_id
                 genomes_id += 1
-                genomes_list.append(ref_prediction)
             ref_id = genomes_names[ref_prediction]
 
-            if read_id in predictions_mapping_vcg:
-
-                if ref_prediction in predictions_mapping_vcg[read_id]:
-                    if predictions_mapping_vcg[read_id][ref_prediction] < float(value_cig):
-                        predictions_mapping_vcg[read_id][ref_prediction] = float(value_cig)
-                    predictions_mapping_vcg_count[read_id][ref_prediction] += 1
-                else:
-                    predictions_mapping_vcg[read_id][ref_prediction] = float(value_cig)
-                    predictions_mapping_vcg_count[read_id][ref_prediction] = 1
-                    
-            else:
-                predictions_mapping_vcg[read_id] = {ref_prediction:float(value_cig)}
-                predictions_mapping_vcg_count[read_id] = {ref_prediction:1}
-
-            line = f.readline()
-
-    for read_id, candidates in predictions_mapping_vcg.items():
-
-        max_values = max(list(candidates.values()))
-
-        for candidate,value_cig in candidates.items():
-            ref_id = genomes_names[candidate]
-            if (read_id not in U) and (read_id not in NU):
+            if read_id not in read_genome_idx:
                 U[read_id] = [[ref_id], [value_cig], [value_cig], value_cig]
-                predictions_mapping[read_id] = candidate
-                continue
-
-            if value_cig == max_values:
-                predictions_mapping[read_id] = candidate
-
-            if read_id in U:
-                if ref_id in U[read_id][0]:
-                    continue
-                NU[read_id] = U[read_id]
-                del U[read_id]  
-
-            if ref_id in NU[read_id][0]:
-                continue
-
-            NU[read_id][0].append(ref_id)
-            NU[read_id][1].append(value_cig)
-            NU[read_id][2].append(value_cig)
-            if value_cig > NU[read_id][3]:
-                NU[read_id][3] = float(value_cig)
+                read_genome_idx[read_id] = {ref_id: 0}
+                if mapping_class_path is not None:
+                    predictions_mapping[read_id] = ref_prediction
+            else:
+                gidx = read_genome_idx[read_id]
+                if ref_id in gidx:
+                    idx = gidx[ref_id]
+                    store = NU if read_id in nu_reads else U
+                    if value_cig > store[read_id][1][idx]:
+                        store[read_id][1][idx] = value_cig
+                        store[read_id][2][idx] = value_cig
+                        if value_cig > store[read_id][3]:
+                            store[read_id][3] = value_cig
+                else:
+                    new_idx = len(gidx)
+                    gidx[ref_id] = new_idx
+                    if read_id not in nu_reads:
+                        NU[read_id] = U.pop(read_id)
+                        nu_reads.add(read_id)
+                    NU[read_id][0].append(ref_id)
+                    NU[read_id][1].append(value_cig)
+                    NU[read_id][2].append(value_cig)
+                    if value_cig > NU[read_id][3]:
+                        NU[read_id][3] = value_cig
+                    if mapping_class_path is not None and value_cig > NU[read_id][3]:
+                        predictions_mapping[read_id] = ref_prediction
 
     if mapping_class_path is not None:
         mapping_output(mapping_class_path, predictions_mapping)
 
+    for ref in ref_intervals:
+        intervals, ref_len = ref_intervals[ref]
+        if not intervals or ref_len == 0:
+            ref_intervals[ref] = 0.0
+            continue
+        intervals.sort()
+        cur_s, cur_e = intervals[0]
+        covered = 0
+        for s, e in intervals[1:]:
+            if s <= cur_e:
+                cur_e = max(cur_e, e)
+            else:
+                covered += cur_e - cur_s
+                cur_s, cur_e = s, e
+        covered += cur_e - cur_s
+        ref_intervals[ref] = covered / ref_len
+
     return U, NU, genomes, species_count, ref_intervals
 
 
-def pathoscope_redistribution(NU, genomes):
-    G = len(genomes)
-
-    pi = [1./G for _ in genomes]
-
-        
+def pathoscope_redistribution(NU):
     for j in NU:
-        z = NU[j] 
-        ind = z[0] 
-        pitmp = [pi[k] for k in ind]      
-        xtmp = [1.*pitmp[k]*z[2][k] for k in range(len(ind))] 
-            
-        xsum = sum(xtmp)
-
+        scores = NU[j][2]
+        xsum = sum(scores)
         if xsum == 0:
-            xnorm = [0.0 for k in xtmp]
+            NU[j][2] = [0.0] * len(scores)
         else:
-            xnorm = [1.*k/xsum for k in xtmp]            
-
-        NU[j][2] = xnorm  
-
+            NU[j][2] = [s / xsum for s in scores]
     return NU
 
 def find_medoid_and_avg_distance(cluster_indices, dist_matrix):
@@ -485,7 +427,7 @@ def initialize_clustering_output_dir(clustering_out):
 
 def build_species_ref_dict(genomes, species_strain_info):
     species_ref_dict = {}
-    references = list(set(genomes.values()))
+    references = set(genomes.values())
 
     for ref in references:
         taxid = ref.split('|')[1]
@@ -493,6 +435,13 @@ def build_species_ref_dict(genomes, species_strain_info):
         species_ref_dict.setdefault(species_taxid, []).append(ref)
 
     return species_ref_dict
+
+def get_top_genomes(value_list, genomes):
+    results = value_list[2]
+    m = max(results)
+    w = [i for i, x in enumerate(results) if x == m]
+    p = [value_list[0][i] for i in w]
+    return [genomes[i] for i in p]
 
 def collect_species_read_data(all_mappings, genomes):
     genome_read_dict = {}
@@ -503,9 +452,17 @@ def collect_species_read_data(all_mappings, genomes):
     ambigous_refs_reads = {}
     ambigous_species_count = 0
     ref_count = {}
+    genomes_with_reads = set()
 
-    for _, name in genomes.items():
-        genome_read_dict[name] = [0] * len(all_mappings)
+    # only allocate for genomes actually referenced by reads in this species
+    relevant_genome_names = set(
+        genomes[gidx]
+        for vals in all_mappings.values()
+        for gidx in vals[0]
+    )
+    n_reads = len(all_mappings)
+    for name in relevant_genome_names:
+        genome_read_dict[name] = [0] * n_reads
         ambigous_refs_count[name] = 0
         ambigous_refs_reads[name] = []
         ref_count[name] = 0
@@ -514,12 +471,7 @@ def collect_species_read_data(all_mappings, genomes):
         reads_index_dict[read_id] = idx
 
     for read_id, value_list in all_mappings.items():
-        results = value_list[2]
-        results_v1 = value_list[1]
-
-        w = [i for i, x in enumerate(results) if x == max(results)]
-        p = [value_list[0][i] for i in w]
-        genome_list = [genomes[i] for i in p]
+        genome_list = get_top_genomes(value_list, genomes)
 
         if len(genome_list) == 1:
             genome = genome_list[0]
@@ -527,19 +479,25 @@ def collect_species_read_data(all_mappings, genomes):
 
             reference_scores.setdefault(genome, [[], []])
             reference_scores[genome][0].append(read_id)
-            reference_scores[genome][1].append(max(results))
+            reference_scores[genome][1].append(max(value_list[2]))
 
             ref_count[genome] += 1
             ambigous_refs_count[genome] += 1
             genome_read_dict[genome][reads_index_dict[read_id]] = 1
+            genomes_with_reads.add(genome)
 
         else:
             for ref in genome_list:
                 ambigous_refs_count[ref] += 1
                 ambigous_refs_reads[ref].append(read_id)
                 genome_read_dict[ref][reads_index_dict[read_id]] = 1
+                genomes_with_reads.add(ref)
 
             ambigous_species_count += 1
+
+    # pre-filter: only keep genomes that have at least one read assigned
+    genome_read_dict = {ref: arr for ref in genomes_with_reads
+                        for arr in [genome_read_dict[ref]]}
 
     return {
         "genome_read_dict": genome_read_dict,
@@ -553,18 +511,9 @@ def collect_species_read_data(all_mappings, genomes):
     }
 
 def resolve_ambiguous_reads(all_mappings, genomes, ambigous_refs_count, classified, reference_scores, ref_count):
-    new_class = {}
-
-    for ref in genomes.values():
-        new_class[ref] = 0
-
     for read_id, value_list in all_mappings.items():
-        results = value_list[2]
         results_v1 = value_list[1]
-
-        w = [i for i, x in enumerate(results) if x == max(results)]
-        p = [value_list[0][i] for i in w]
-        genome_list = [genomes[i] for i in p]
+        genome_list = get_top_genomes(value_list, genomes)
 
         if len(genome_list) <= 1:
             continue
@@ -579,52 +528,40 @@ def resolve_ambiguous_reads(all_mappings, genomes, ambigous_refs_count, classifi
                 best_count = c
 
         classified.append((read_id, best_ref))
-        new_class[best_ref] += 1
         ref_count[best_ref] += 1
 
         reference_scores.setdefault(best_ref, [[], []])
         reference_scores[best_ref][0].append(read_id)
         reference_scores[best_ref][1].append(max(results_v1))
 
-    return classified, reference_scores, ref_count, new_class
+    return classified, reference_scores, ref_count
 
-def cluster_species_references(species_id, genome_read_dict, eps_value):
-    new_genome_read_dict = {ref: arr for ref, arr in genome_read_dict.items() if 1 in arr}
-
-    if len(new_genome_read_dict) == 0:
+def cluster_species_references(genome_read_dict, eps_value):
+    # genome_read_dict is already pre-filtered by collect_species_read_data
+    if len(genome_read_dict) == 0:
         return {
             "filtered_genome_read_dict": {},
             "clusters": [],
             "cluster_representatives": {},
         }
 
-    ref_ids = list(new_genome_read_dict.keys())
-    arrays = np.array(list(new_genome_read_dict.values()))
+    ref_ids = list(genome_read_dict.keys())
+    key_to_idx = {k: i for i, k in enumerate(ref_ids)}
+    arrays = np.array(list(genome_read_dict.values()))
     dist_matrix = pairwise_distances(arrays, metric='jaccard')
 
     db = DBSCAN(metric='precomputed', eps=eps_value, min_samples=1)
     labels = db.fit_predict(dist_matrix)
 
-    representatives = {}
-    avg_distances = {}
     clusters = []
     cluster_representatives = {}
 
-    unique_labels = set(labels)
-
-    for label in unique_labels:
-        if label == -1:
-            continue
-
+    for label in set(labels):
         cluster_indices = np.where(labels == label)[0]
-        medoid_idx, avg_dist = find_medoid_and_avg_distance(cluster_indices, dist_matrix)
+        medoid_idx, _ = find_medoid_and_avg_distance(cluster_indices, dist_matrix)
         medoid = ref_ids[medoid_idx]
 
-        representatives[label] = medoid
-        avg_distances[label] = avg_dist
-
-    for cluster_id, medoid in representatives.items():
-        cluster_refs = [ref_ids[i] for i, val in enumerate(labels) if val == cluster_id]
+        cluster_refs = [ref_ids[i] for i in cluster_indices]
         ordered_cluster = [medoid] + [ref for ref in cluster_refs if ref != medoid]
         clusters.append(ordered_cluster)
 
@@ -632,15 +569,18 @@ def cluster_species_references(species_id, genome_read_dict, eps_value):
             cluster_representatives[ref] = medoid
 
     return {
-        "filtered_genome_read_dict": new_genome_read_dict,
+        "filtered_genome_read_dict": genome_read_dict,
         "clusters": clusters,
         "cluster_representatives": cluster_representatives,
+        "ref_ids": ref_ids,
+        "key_to_idx": key_to_idx,
+        "dist_matrix": dist_matrix,
     }
 
 def summarize_cluster_support(clusters, reference_scores, high_score_threshold):
     ref_high_scores = {}
     ref_high_scores_global = {}
-    low_score_reads_global = []
+    low_score_read_count = 0
     assigned_reads = 0
 
     logging.info("======Cluster support summary======")
@@ -650,18 +590,17 @@ def summarize_cluster_support(clusters, reference_scores, high_score_threshold):
             if ref in reference_scores:
                 scores = reference_scores[ref]
                 high_scores = [s for s in scores[1] if s >= high_score_threshold]
-                low_score_reads = [scores[0][k] for k in range(len(scores[0])) if scores[1][k] < high_score_threshold]
 
-                low_score_reads_global.extend(low_score_reads)
+                low_score_read_count += sum(1 for s in scores[1] if s < high_score_threshold)
                 ref_high_scores[ref] = len(high_scores)
                 ref_high_scores_global[ref] = len(high_scores) / len(scores[1]) if len(scores[1]) > 0 else 0.0
 
-                d = len(high_scores) if len(high_scores) > 0 else 1
+                avg_score = sum(high_scores) / len(high_scores) if high_scores else 0.0
                 assigned_reads += len(scores[0])
 
                 logging.info(
                     "Reference: {}, Assigned Reads: {}, Average Score: {:.4f}, High Scores: {}".format(
-                        ref, len(scores[0]), sum(high_scores) / d, len(high_scores)
+                        ref, len(scores[0]), avg_score, len(high_scores)
                     )
                 )
             else:
@@ -669,27 +608,35 @@ def summarize_cluster_support(clusters, reference_scores, high_score_threshold):
                 ref_high_scores_global[ref] = 0.0
                 logging.info("Reference: {}, Assigned Reads: 0, Average Score: 0.0000, High Scores: 0".format(ref))
 
-    low_score_reads_global = list(set(low_score_reads_global))
-
-    logging.info("Total low score reads globally: {}".format(len(low_score_reads_global)))
+    logging.info("Total low score reads globally: {}".format(low_score_read_count))
     logging.info("==========================================")
 
     return {
         "ref_high_scores": ref_high_scores,
         "ref_high_scores_global": ref_high_scores_global,
-        "low_score_reads_global": low_score_reads_global,
         "assigned_reads": assigned_reads,
     }
 
 
-def choose_reference_reassignments(clusters, clusters_species, s_genome_read_dicts,
+def choose_reference_reassignments(clusters, clusters_species, s_species_dist,
                                    ref_high_scores, ref_high_scores_global, cfg):
     changes = {}
+    species_strong_cache = {}
 
     logging.info("======Reference reassignment summary======")
 
     for i, cluster in enumerate(clusters):
         species = clusters_species[i]
+        keys, key_to_idx, dist_matrix = s_species_dist[species]
+
+        if species not in species_strong_cache:
+            strong_idx = np.array([
+                idx for idx, k in enumerate(keys)
+                if ref_high_scores.get(k, 0) > cfg["min_high_score_reads"]
+                or ref_high_scores_global.get(k, 0.0) > cfg["min_high_score_fraction"]
+            ], dtype=int)
+            species_strong_cache[species] = (strong_idx, [keys[j] for j in strong_idx])
+        strong_idx, strong_keys = species_strong_cache[species]
 
         for ref in cluster:
             if ref not in ref_high_scores:
@@ -698,9 +645,8 @@ def choose_reference_reassignments(clusters, clusters_species, s_genome_read_dic
                 ref_high_scores_global[ref] = 0.0
 
             weak_ref = (
-                (ref_high_scores[ref] < cfg["min_high_score_reads"]) or
+                ref_high_scores[ref] < cfg["min_high_score_reads"] or
                 (
-                    ref_high_scores[ref] >= cfg["min_high_score_reads"] and
                     ref_high_scores[ref] < cfg["mid_high_score_reads"] and
                     ref_high_scores_global[ref] < cfg["min_high_score_fraction"]
                 )
@@ -709,40 +655,18 @@ def choose_reference_reassignments(clusters, clusters_species, s_genome_read_dic
             if not weak_ref:
                 continue
 
-            genome_read_dict = s_genome_read_dicts[species]
-            keys = list(genome_read_dict.keys())
-            arrays = np.array(list(genome_read_dict.values()))
-            dist_matrix = pairwise_distances(arrays, metric='jaccard')
-
-            ref_i = keys.index(ref)
-            row = dist_matrix[ref_i].copy()
-            row[ref_i] = np.inf
-            sorted_idx = np.argsort(row)
-
-            for j in sorted_idx:
-                cand = keys[j]
-
-                if cand == ref:
+            ref_i = key_to_idx[ref]
+            for j in np.argsort(dist_matrix[ref_i, strong_idx]):
+                cand = strong_keys[j]
+                if cand == ref or cand in changes:
                     continue
-                if cand in changes:
-                    continue
-                if cand not in ref_high_scores or cand not in ref_high_scores_global:
-                    continue
-
-                strong_cand = (
-                    (ref_high_scores[cand] > cfg["min_high_score_reads"]) or
-                    (ref_high_scores_global[cand] > cfg["min_high_score_fraction"])
-                )
-
-                if strong_cand:
-                    changes[ref] = cand
-                    closest_distance = row[j]
-                    logging.info(
-                        "Cluster {} - Reference {} changed to {} based on clustering with distance {:.4f}".format(
-                            i + 1, ref, cand, closest_distance
-                        )
+                changes[ref] = cand
+                logging.info(
+                    "Cluster {} - Reference {} changed to {} based on clustering with distance {:.4f}".format(
+                        i + 1, ref, cand, dist_matrix[ref_i, strong_idx[j]]
                     )
-                    break
+                )
+                break
 
     logging.info("==========================================")
     return changes
@@ -757,25 +681,20 @@ def get_ref_count(classified, changes):
 def recompute_cluster_representatives_by_count(clusters, ref_count):
     changes = {}
     representatives_new = []
-
     updated_clusters = []
 
     for cluster in clusters:
-        max_count = 0
-        max_ref = ""
+        max_ref = max(cluster, key=lambda r: ref_count.get(r, 0))
 
-        for ref in cluster:
-            count = ref_count[ref] if ref in ref_count else 0
-            if count > max_count:
-                max_count = count
-                max_ref = ref
-
-        if max_ref != "":
+        if ref_count.get(max_ref, 0) > 0:
             for ref in cluster:
                 changes[ref] = max_ref
+            ordered = [max_ref] + [ref for ref in cluster if ref != max_ref]
+        else:
+            ordered = cluster
 
-        representatives_new.append(max_ref)
-        updated_clusters.append([max_ref] + [ref for ref in cluster if ref != max_ref])
+        representatives_new.append(ordered[0])
+        updated_clusters.append(ordered)
 
     return changes, representatives_new, updated_clusters
 
@@ -788,37 +707,22 @@ def write_final_cluster_outputs(clustering_out, updated_clusters, representative
         for rep in representatives_new:
             f_rep.write(rep + "\n")
 
-def write_final_assignments(classified, initial_changes, cluster_changes, output_path):
+def write_final_assignments(classified, changes, cluster_changes, output_path):
     with open(output_path, "w") as f:
         for read_id, ref in classified:
-            if ref in cluster_changes:
-                final_ref = cluster_changes[ref]
-            elif ref in initial_changes:
-                final_ref = initial_changes[ref]
-            else:
-                final_ref = ref
-
-            if final_ref == "":
-                final_ref = ref
-
+            ref = changes.get(ref, ref)
+            final_ref = cluster_changes.get(ref, ref)
             f.write(f"{read_id} : {final_ref}\n")
 
-def write_reference_summary(classified, initial_changes, cluster_changes,
-                             ref_intervals, output_path):
+def write_reference_summary(classified, changes, cluster_changes, ref_intervals, output_path):
     """
     Write a TSV with one row per final reference:
         reference_name  \t  read_count  \t  horizontal_coverage
     """
     ref_count = {}
     for read_id, ref in classified:
-        if ref in cluster_changes:
-            final_ref = cluster_changes[ref]
-        elif ref in initial_changes:
-            final_ref = initial_changes[ref]
-        else:
-            final_ref = ref
-        if final_ref == "":
-            final_ref = ref
+        ref = changes.get(ref, ref)
+        final_ref = cluster_changes.get(ref, ref)
         ref_count[final_ref] = ref_count.get(final_ref, 0) + 1
 
     with open(output_path, "w") as f:
@@ -860,25 +764,23 @@ def run(args):
         min_mean_score=cfg["species_min_mean_score"],
         low_count_cap=cfg["species_low_count_cap"]
     )
-    U_species, NU_species = species_split(U, NU, species_class, genomes, args.strain_species_info)
+    U_species, NU_species = species_split(U, NU, species_class, genomes, species_strain_info)
 
     species_ref_dict = build_species_ref_dict(genomes, species_strain_info)
     species = list(set(species_class.values()))
 
-    s_genome_read_dicts = {}
+    s_species_dist = {}
     clusters = []
     clusters_species = []
-    cluster_representatives = {}
     classified = []
     reference_scores = {}
-    assigned_reads = 0
 
     for s in species:
         logging.info("Species {} has {} references, eps value for clustering: {}".format(
             s, len(species_ref_dict[s]), cfg["cluster_eps"])
         )
 
-        NU_result = pathoscope_redistribution(NU_species[s], genomes)
+        NU_result = pathoscope_redistribution(NU_species[s])
         all_mappings = {**U_species[s], **NU_result}
 
         species_data = collect_species_read_data(all_mappings, genomes)
@@ -886,7 +788,7 @@ def run(args):
         classified.extend(species_data["classified"])
         reference_scores.update(species_data["reference_scores"])
 
-        classified, reference_scores, _, _ = resolve_ambiguous_reads(
+        classified, reference_scores, _ = resolve_ambiguous_reads(
             all_mappings,
             genomes,
             species_data["ambigous_refs_count"],
@@ -896,25 +798,26 @@ def run(args):
         )
 
         clustering_result = cluster_species_references(
-            s,
             species_data["genome_read_dict"],
             cfg["cluster_eps"]
         )
 
-        s_genome_read_dicts[s] = clustering_result["filtered_genome_read_dict"]
+        if clustering_result["clusters"]:
+            s_species_dist[s] = (
+                clustering_result["ref_ids"],
+                clustering_result["key_to_idx"],
+                clustering_result["dist_matrix"],
+            )
         clusters.extend(clustering_result["clusters"])
         clusters_species.extend([s] * len(clustering_result["clusters"]))
-        cluster_representatives.update(clustering_result["cluster_representatives"])
 
     support_summary = summarize_cluster_support(
         clusters, reference_scores, cfg["high_score_threshold"]
     )
-    assigned_reads = support_summary["assigned_reads"]
-
     changes = choose_reference_reassignments(
         clusters,
         clusters_species,
-        s_genome_read_dicts,
+        s_species_dist,
         support_summary["ref_high_scores"],
         support_summary["ref_high_scores_global"],
         cfg,
@@ -926,22 +829,15 @@ def run(args):
         clusters, ref_count
     )
 
-    write_final_cluster_outputs(args.clustering_out, updated_clusters, representatives_new)
-    write_final_assignments(
-        classified,
-        changes,
-        changes2,
-        args.read_class_output
-    )
-    write_reference_summary(
-        classified,
-        changes,
-        changes2,
-        ref_intervals,
-        args.ref_summary_output
-    )
+    active = [ref_count.get(rep, 0) > 0 for rep in representatives_new]
+    updated_clusters    = [c for c, keep in zip(updated_clusters,    active) if keep]
+    representatives_new = [r for r, keep in zip(representatives_new, active) if keep]
 
-    logging.info("Total assigned reads: {}".format(assigned_reads))
+    write_final_cluster_outputs(args.clustering_out, updated_clusters, representatives_new)
+    write_final_assignments(classified, changes, changes2, args.read_class_output)
+    write_reference_summary(classified, changes, changes2, ref_intervals, args.ref_summary_output)
+
+    logging.info("Total assigned reads: {}".format(len(classified)))
 
 
 def main():
